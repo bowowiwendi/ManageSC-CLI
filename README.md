@@ -46,6 +46,10 @@ Di setiap input bisa mengetik `batal` (atau `cancel`/`q`/`exit`) untuk
 membatalkan tanpa error / keluar tiba-tiba. Tampilan daftar menggunakan
 tabel bercorak (box-drawing) dengan ringkasan Total/Kadaluarsa.
 
+Navigasi menu menggunakan **tombol ↑/↓** lalu **Enter** (tidak perlu
+mengetik angka). Semua layar menu ditampilkan di tengah. Bila stdin tidak
+TTY (pipa), fallback mengetik angka tetap tersedia.
+
 ## Mode perintah
 ```bash
 managesc add --username budi --tipe limit --masa-aktif 30 --ip 1.2.3.4 \

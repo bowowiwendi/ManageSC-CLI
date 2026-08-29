@@ -27,6 +27,96 @@ def _is_cancel(x):
 _CANCEL_TOKENS = {"batal", "cancel", "/q", "q", "exit", "keluar"}
 
 
+def _select_typed(title, labels, banner=False):
+    w = shutil.get_terminal_size((80, 24)).columns
+    for line in (BANNER if banner else []):
+        print(line.center(w))
+    print(title.center(w))
+    bw = max((len(l) for l in labels), default=10)
+    indent = max(0, (w - bw) // 2)
+    for i, l in enumerate(labels, 1):
+        print(" " * indent + f"{i}. {l}")
+    while True:
+        try:
+            raw = input(" " * indent + f"Pilih (1-{len(labels)}, batal)=> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if raw.lower() in _CANCEL_TOKENS:
+            return None
+        try:
+            idx = int(raw) - 1
+        except ValueError:
+            continue
+        if 0 <= idx < len(labels):
+            return idx
+
+
+def _nav_raw(title, labels, banner):
+    import termios
+    import tty
+    import select as _sel
+    fd = sys.stdin.fileno()
+    w = shutil.get_terminal_size((80, 24)).columns
+    banner_lines = BANNER if banner else []
+    bw = max((len(l) for l in labels), default=10)
+    indent = max(0, (w - bw) // 2)
+    sel = 0
+
+    def draw():
+        sys.stdout.write("\033[2J\033[H")
+        for line in banner_lines:
+            sys.stdout.write(line.center(w) + "\n")
+        sys.stdout.write(title.center(w) + "\n")
+        sys.stdout.write("[↑/↓ pilih  Enter konfirm  q/Esc batal]".center(w) + "\n")
+        for i, l in enumerate(labels):
+            mark = "> " if i == sel else "  "
+            s = (mark + l).ljust(bw + 2)
+            if i == sel:
+                s = "\033[1;92m" + s + "\033[0m"
+            sys.stdout.write(" " * indent + s + "\n")
+        sys.stdout.flush()
+
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        draw()
+        while True:
+            ch = os.read(fd, 1)
+            if ch == b"\x03":
+                return None
+            if ch == b"\x1b":
+                r, _, _ = _sel.select([fd], [], [], 0.1)
+                if not r:
+                    return None
+                nxt = os.read(fd, 1)
+                if nxt != b"[":
+                    return None
+                d = os.read(fd, 1)
+                if d == b"A":
+                    sel = (sel - 1) % len(labels); draw()
+                elif d == b"B":
+                    sel = (sel + 1) % len(labels); draw()
+            elif ch in (b"q", b"Q"):
+                return None
+            elif ch in (b"\r", b"\n", b" "):
+                return sel
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+
+def _select(title, labels, banner=False):
+    """Pilih item tanpa ketik angka (navigasi arrow di TTY asli).
+    Fallback ke pengetikan angka bila stdin tidak TTY."""
+    if sys.stdin.isatty():
+        try:
+            return _nav_raw(title, labels, banner)
+        except Exception:
+            pass
+    return _select_typed(title, labels, banner)
+
+
 def c(text, *codes):
     if not USE_COLOR:
         return text
@@ -803,18 +893,19 @@ def text_menu_main():
         tok = req_id()
         if _is_cancel(tok):
             return
-        print("1. Jalankan perintah\n2. Setup otomatis (WendyVpn)\n3. Masuk terminal VPS (interaktif)")
-        p = ask("Pilih")
-        if _is_cancel(p):
+        labels = ["Jalankan perintah", "Setup otomatis (WendyVpn)",
+                  "Masuk terminal VPS (interaktif)", "Kembali"]
+        idx = _select("SSH — " + tok, labels)
+        if idx is None or labels[idx] == "Kembali":
             return
-        if p == "1":
+        if idx == 0:
             cc = ask("Perintah (kosong=test)")
             if _is_cancel(cc):
                 return
             print(_capture(cmd_ssh, types.SimpleNamespace(id=tok, cmd=cc or None, setup=False)))
-        elif p == "2":
+        elif idx == 1:
             print(_capture(cmd_ssh, types.SimpleNamespace(id=tok, cmd=None, setup=True)))
-        elif p == "3":
+        elif idx == 2:
             vps = next((it for it in load_vps() if it["id"] == resolve_id(tok)), None)
             if not vps or not vps.get("userSsh") or not vps.get("passSsh"):
                 print("User/Password SSH kosong — isi lewat Update.")
@@ -824,11 +915,9 @@ def text_menu_main():
             out = ssh_shell(host, vps["userSsh"], vps["passSsh"])
             if out:
                 print(out)
-        else:
-            print("Pilihan tidak valid.")
 
     def do_dns():
-        def pick():
+        def pick_domain():
             zones, err = _cf_zones()
             if err:
                 print(err)
@@ -836,94 +925,85 @@ def text_menu_main():
             if not zones:
                 print("Tidak ada domain")
                 return None
-            for i, z in enumerate(zones, 1):
-                print(f"  {i}. {z['name']}  ({z['status']})")
-            n = ask_int("Pilih domain (kosong=batal)")
-            if _is_cancel(n):
-                return None
-            return zones[n - 1] if 0 <= n - 1 < len(zones) else None
+            labels = [f"{z['name']}  ({z['status']})" for z in zones]
+            idx = _select("Pilih Domain", labels)
+            return zones[idx] if idx is not None else None
 
-        print("1. Setel kredensial\n2. List zona\n3. List record\n4. Tambah record\n5. Hapus record\n6. Update DNS VPS -> push GitHub")
-        p = ask("Pilih")
-        if _is_cancel(p):
-            return
-        if p == "1":
-            save_cf({"email": ask("Cloudflare email"), "key": ask("Global API Key")})
-            print("Disimpan")
-        elif p == "2":
-            zones, err = _cf_zones()
-            print(err or "\n".join(f"  {z['name']}  id={z['id']}" for z in (zones or [])) or "kosong")
-        elif p == "3":
-            z = pick()
-            if z:
-                print(_capture(cmd_dns, types.SimpleNamespace(action="records", email=None, key=None,
-                         zone=z["id"], record=None, type=None, name=None, content=None, ttl="1", proxied=False)))
-        elif p == "4":
-            z = pick()
-            if z:
-                ty = ask("Type", "A"); nm = ask("Name (kosong=root)"); ct = ask("Content (IP)")
-                pr = ask("Proxied (y/n)") == "y"
-                print(_capture(cmd_dns, types.SimpleNamespace(action="add", email=None, key=None,
-                         zone=z["id"], record=None, type=ty, name=nm or z["name"], content=ct, ttl="1", proxied=pr)))
-        elif p == "5":
-            z = pick()
-            if z:
+        labels = ["Setel kredensial", "List zona", "List record",
+                  "Tambah record", "Hapus record", "Update DNS VPS -> push GitHub", "Kembali"]
+        while True:
+            idx = _select("Cloudflare DNS", labels)
+            if idx is None or labels[idx] == "Kembali":
+                return
+            if labels[idx] == "Setel kredensial":
+                save_cf({"email": ask("Cloudflare email"), "key": ask("Global API Key")})
+                print("Disimpan")
+            elif labels[idx] == "List zona":
+                zones, err = _cf_zones()
+                print(err or "\n".join(f"  {z['name']}  id={z['id']}" for z in (zones or [])) or "kosong")
+            elif labels[idx] == "List record":
+                z = pick_domain()
+                if z:
+                    print(_capture(cmd_dns, types.SimpleNamespace(action="records", email=None, key=None,
+                             zone=z["id"], record=None, type=None, name=None, content=None, ttl="1", proxied=False)))
+            elif labels[idx] == "Tambah record":
+                z = pick_domain()
+                if z:
+                    ty = gt("Type") or "A"; nm = gt("Name (kosong=root)"); ct = gt("Content (IP)")
+                    pr = gt("Proxied? (y/n)") == "y"
+                    print(_capture(cmd_dns, types.SimpleNamespace(action="add", email=None, key=None,
+                             zone=z["id"], record=None, type=ty, name=nm or z["name"], content=ct, ttl="1", proxied=pr)))
+            elif labels[idx] == "Hapus record":
+                z = pick_domain()
+                if not z:
+                    return
                 body, _ = cf_request("GET", f"zones/{z['id']}/dns_records")
                 recs = body.get("result", []) if body and body.get("success") else []
-                for i, r in enumerate(recs, 1):
-                    print(f"  {i}. {r['type']} {r['name']} -> {r['content']}")
-                n = ask_int("Pilih record")
-                if _is_cancel(n):
-                    return
-                if 0 <= n - 1 < len(recs):
+                rlabels = [f"{r['type']} {r['name']} -> {r['content']}" for r in recs]
+                ri = _select("Pilih Record", rlabels)
+                if ri is not None:
                     print(_capture(cmd_dns, types.SimpleNamespace(action="del", email=None, key=None,
-                         zone=z["id"], record=recs[n - 1]["id"], type=None, name=None, content=None, ttl="1", proxied=False)))
-        elif p == "6":
-            z = pick()
-            if not z:
-                return
-            data = load_vps()
-            if not data:
-                print("Data VPS kosong")
-                return
-            for i, v in enumerate(data, 1):
-                print(f"  {i}. {v['username']} {v['ipVps']} ({v['masaAktif']})")
-            n = ask_int("Pilih VPS")
-            if _is_cancel(n):
-                return
-            if not (0 <= n - 1 < len(data)):
-                return
-            v = data[n - 1]
-            ip = v["ipVps"].lstrip("'")
-            nm = ask("Subdomain (kosong=root domain)", v["username"])
-            name = nm or z["name"]
-            print(_dns_upsert(z["id"], name, ip))
-            gh = load_github()
-            if gh and gh.get("enabled") and gh.get("token"):
-                print(_capture(cmd_github, types.SimpleNamespace(action="sync")))
-            else:
-                print("(GitHub tidak enabled/token kosong -> skip push)")
-        else:
-            print("Pilihan tidak valid.")
+                             zone=z["id"], record=recs[ri]["id"], type=None, name=None, content=None, ttl="1", proxied=False)))
+            elif labels[idx] == "Update DNS VPS -> push GitHub":
+                z = pick_domain()
+                if not z:
+                    return
+                data = load_vps()
+                if not data:
+                    print("Data VPS kosong")
+                    return
+                vlabels = [f"{v['username']}  {v['ipVps']}  ({v['masaAktif']})" for v in data]
+                vi = _select("Pilih VPS", vlabels)
+                if vi is None:
+                    return
+                v = data[vi]
+                ip = v["ipVps"].lstrip("'")
+                nm = gt("Subdomain (kosong=root domain)") or v["username"]
+                name = nm or z["name"]
+                print(_dns_upsert(z["id"], name, ip))
+                gh = load_github()
+                if gh and gh.get("enabled") and gh.get("token"):
+                    print(_capture(cmd_github, types.SimpleNamespace(action="sync")))
+                else:
+                    print("(GitHub tidak enabled/token kosong -> skip push)")
 
     def do_github():
-        print("1. Setel konfig\n2. Import (pull)\n3. Sync (push)\n4. Tampilkan isi")
-        p = ask("Pilih")
-        if _is_cancel(p):
-            return
-        if p == "1":
-            d = load_github() or {}
-            d.update({"username": ask("GitHub user"), "repo": ask("Repo"), "filePath": ask("File path"),
-                      "token": ask("Token"), "enabled": ask("Enabled (true/false)") == "true"})
-            save_github(d); print("Disimpan")
-        elif p == "2":
-            print(_capture(cmd_github, types.SimpleNamespace(action="import")))
-        elif p == "3":
-            print(_capture(cmd_github, types.SimpleNamespace(action="sync")))
-        elif p == "4":
-            print(_capture(cmd_github, types.SimpleNamespace(action="show")))
-        else:
-            print("Pilihan tidak valid.")
+        labels = ["Setel konfig", "Import (pull)", "Sync (push)", "Tampilkan isi", "Kembali"]
+        while True:
+            idx = _select("GitHub", labels)
+            if idx is None or labels[idx] == "Kembali":
+                return
+            if labels[idx] == "Setel konfig":
+                d = load_github() or {}
+                d.update({"username": ask("GitHub user"), "repo": ask("Repo"), "filePath": ask("File path"),
+                          "token": ask("Token"), "enabled": ask("Enabled (true/false)") == "true"})
+                save_github(d); print("Disimpan")
+            elif labels[idx] == "Import (pull)":
+                print(_capture(cmd_github, types.SimpleNamespace(action="import")))
+            elif labels[idx] == "Sync (push)":
+                print(_capture(cmd_github, types.SimpleNamespace(action="sync")))
+            elif labels[idx] == "Tampilkan isi":
+                print(_capture(cmd_github, types.SimpleNamespace(action="show")))
 
     def _do_delete():
         tok = ask("ID / username")
@@ -944,36 +1024,18 @@ def text_menu_main():
         ("GitHub", do_github),
         ("Keluar", None),
     ]
+    labels = [l for l, _ in menu]
     while True:
-        w = shutil.get_terminal_size((80, 24)).columns
-        for line in BANNER:
-            print(c(line.center(w), 1, 96))
-        print(c("=== ManageSC CLI — menu teks ===".center(w), 1, 96))
-        menu_lines = [f"{i:2}. {l}" for i, (l, _) in enumerate(menu, 1)]
-        block_w = max((len(x) for x in menu_lines), default=20)
-        indent = max(0, (w - block_w) // 2)
-        for ml in menu_lines:
-            print(" " * indent + c(ml, 1, 92))
-        try:
-            choice = input(" " * indent + c("Pilih (1-N, 0=Keluar, 'batal'=batal)> ", 1, 93)).strip()
-        except (EOFError, KeyboardInterrupt):
+        idx = _select("ManageSC CLI — menu utama", labels, banner=True)
+        if idx is None:
             break
-        if choice.lower() in ("0", "q", "exit", "keluar") or choice == str(len(menu)):
+        fn = menu[idx][1]
+        if fn is None:
             break
-        if choice.lower() in _CANCEL_TOKENS:
-            continue
         try:
-            idx = int(choice) - 1
-        except ValueError:
-            continue
-        if 0 <= idx < len(menu):
-            fn = menu[idx][1]
-            if fn is None:
-                break
-            try:
-                fn()
-            except Exception as e:
-                print("Error:", e)
+            fn()
+        except Exception as e:
+            print("Error:", e)
 
 
 def _run_tui(stdscr):
