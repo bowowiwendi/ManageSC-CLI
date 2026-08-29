@@ -21,6 +21,11 @@ from datetime import datetime, timedelta, date
 # ---------------------------------------------------------------------------
 USE_COLOR = sys.stdout.isatty()
 
+CANCEL = object()
+def _is_cancel(x):
+    return x is CANCEL
+_CANCEL_TOKENS = {"batal", "cancel", "/q", "q", "exit", "keluar"}
+
 
 def c(text, *codes):
     if not USE_COLOR:
@@ -452,58 +457,77 @@ def ssh_run(host, user, passwd, command, port=22, timeout=60):
         return f"Error: {e}"
 
 
+def ssh_shell(host, user, passwd, port=22):
+    """Masuk ke shell VPS secara interaktif (terasa seperti pindah terminal)."""
+    import shutil
+    import subprocess
+    if passwd:
+        if not shutil.which("sshpass"):
+            return "Error: sshpass tidak tersedia. Install `sshpass` atau pakai SSH key (kosongkan --ssh-pass)."
+        cmd = ["sshpass", "-p", passwd, "ssh", "-o", "StrictHostKeyChecking=no",
+               "-o", "ConnectTimeout=15", "-p", str(port), "-tt", f"{user}@{host}"]
+    else:
+        cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+               "-p", str(port), "-tt", f"{user}@{host}"]
+    try:
+        subprocess.run(cmd)
+        return ""
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 def table_str(data, color=False):
     if not data:
-        return "(kosong)"
+        return c("(kosong)", 1, 90) if color else "(kosong)"
     headers = ["ID", "Username", "Tipe", "Masa Aktif", "IP VPS", "Email", "RAM", "SSH"]
     rows = [[it.get("id", "")[:8], it.get("username", ""), it.get("tipeAkun", ""),
-             it.get("masaAktif", ""), it.get("ipVps", ""), it.get("emailMember", ""),
+             it.get("masaAktif", ""), it.get("ipVps", "").lstrip("'"), it.get("emailMember", ""),
              it.get("ram", ""), "on" if it.get("userSsh") else "-"] for it in data]
     widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
-    lines = [" | ".join(
-        c(h.ljust(widths[i]), 1, 96) if color else h.ljust(widths[i]) for i, h in enumerate(headers)),
-        "-+-".join("-" * w for w in widths)]
+
+    def hc(h, w):
+        return c(h.ljust(w), 1, 95) if color else h.ljust(w)
+
+    def vc(val, w, i):
+        base = str(val).ljust(w)
+        if not color:
+            return base
+        if i == 1:
+            return c(base, 1, 97)
+        if i == 2:
+            return c(base, 1, 96 if val == "unli" else 93)
+        if i == 7:
+            return c(base, 1, 92 if val == "on" else 90)
+        return base
+
+    top = "┌" + "┬".join("─" * (w + 2) for w in widths) + "┐"
+    mid = "├" + "┼".join("─" * (w + 2) for w in widths) + "┤"
+    bot = "└" + "┴".join("─" * (w + 2) for w in widths) + "┘"
+    line_hdr = "│ " + " │ ".join(hc(h, widths[i]) for i, h in enumerate(headers)) + " │"
+    lines = [top, line_hdr, mid]
     for r in rows:
-        cells = []
-        for i, val in enumerate(r):
-            if color and i == 7:
-                val = c(val.ljust(widths[i]), 32 if val == "on" else 90)
-            elif color and i == 1:
-                val = c(val.ljust(widths[i]), 1, 97)
-            else:
-                val = val.ljust(widths[i])
-            cells.append(val)
-        lines.append(" | ".join(cells))
+        lines.append("│ " + " │ ".join(vc(r[i], widths[i], i) for i in range(len(headers))) + " │")
+    lines.append(bot)
+    today = date.today()
+    expired = 0
+    for it in data:
+        ma = it.get("masaAktif", "")
+        if it.get("tipeAkun") == "limit" and ma:
+            try:
+                if datetime.strptime(ma, "%Y-%m-%d").date() < today:
+                    expired += 1
+            except Exception:
+                pass
+    summ = f"Total: {len(data)}   Kadaluarsa: {expired}"
+    lines.append(c(summ, 1, 93) if color else summ)
     return "\n".join(lines)
 
 
 def print_table(data):
     print(table_str(data, color=USE_COLOR))
-    if not data:
-        print("(kosong)")
-        return
-    headers = ["ID", "Username", "Tipe", "Masa Aktif", "IP VPS", "Email", "RAM", "SSH"]
-    rows = []
-    for it in data:
-        rows.append([
-            it.get("id", "")[:8],
-            it.get("username", ""),
-            it.get("tipeAkun", ""),
-            it.get("masaAktif", ""),
-            it.get("ipVps", ""),
-            it.get("emailMember", ""),
-            it.get("ram", ""),
-            "on" if it.get("userSsh") else "-",
-        ])
-    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
-    line = " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
-    print(line)
-    print("-+-".join("-" * w for w in widths))
-    for r in rows:
-        print(" | ".join(r[i].ljust(widths[i]) for i in range(len(headers))))
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +558,10 @@ def cmd_ssh(args):
         print(ssh_run(host, vps["userSsh"], vps["passSsh"], SETUP_SCRIPT, timeout=120))
     elif args.cmd:
         print(ssh_run(host, vps["userSsh"], vps["passSsh"], args.cmd))
+    elif args.shell:
+        out = ssh_shell(host, vps["userSsh"], vps["passSsh"])
+        if out:
+            print(out)
     else:
         print(ssh_run(host, vps["userSsh"], vps["passSsh"], "echo OK-CONNECTED"))
 
@@ -682,64 +710,122 @@ def tui_main():
 
 def text_menu_main():
     def ask(p, d=""):
-        v = input(f"{p} [{d}]: ").strip()
+        try:
+            v = input((f"{p} [{d}]: " if d else f"{p}: ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            return CANCEL
+        if v.lower() in _CANCEL_TOKENS:
+            return CANCEL
         return v or d
+
+    def ask_int(p, d=None):
+        r = ask(p, str(d) if d is not None else "")
+        if _is_cancel(r):
+            return CANCEL
+        if r == "" and d is not None:
+            return d
+        try:
+            return int(r)
+        except ValueError:
+            print("Harus berupa angka.")
+            return CANCEL
+
+    def req_id(prompt="ID / username"):
+        tok = ask(prompt)
+        if _is_cancel(tok):
+            return CANCEL
+        if not resolve_id(tok):
+            print("Tidak ditemukan.")
+            return CANCEL
+        return tok
 
     def do_add():
         u = ask("Username")
+        if _is_cancel(u):
+            return print("Dibatalkan.")
         t = ask("Tipe (limit/unli)")
+        if _is_cancel(t):
+            return print("Dibatalkan.")
         if t not in ("limit", "unli"):
-            print("Tipe harus limit/unli"); return
+            print("Tipe harus limit/unli")
+            return
         ma = ask("Masa aktif (hari / kosong=Lifetime)")
+        if _is_cancel(ma):
+            return print("Dibatalkan.")
         ip = ask("IP VPS")
-        item = add_entry(u, t, ma, ip, ask("Email"), ask("RAM"), ask("Pesan"),
-                         ask("SSH user"), ask("SSH pass"), str(ask("Server aktif (true/false)", "true")).lower() != "false")
+        if _is_cancel(ip):
+            return print("Dibatalkan.")
+        em = ask("Email"); rm = ask("RAM"); ps = ask("Pesan")
+        su = ask("SSH user"); sp = ask("SSH pass")
+        sa = ask("Server aktif (true/false)", "true")
+        for val in (em, rm, ps, su, sp, sa):
+            if _is_cancel(val):
+                return print("Dibatalkan.")
+        item = add_entry(u, t, ma, ip, em, rm, ps, su, sp, str(sa).lower() != "false")
         print("Disimpan:\n" + table_str([item]))
 
     def do_update():
-        tok = ask("ID / username")
-        if not resolve_id(tok):
-            print("Tidak ditemukan"); return
+        tok = req_id()
+        if _is_cancel(tok):
+            return
         f = {}
         for k, a in [("username", "username"), ("tipe", "tipeAkun"), ("masa-aktif", "masaAktif"),
                      ("ip", "ipVps"), ("email", "emailMember"), ("ram", "ram"), ("pesan", "pesan"),
                      ("ssh-user", "userSsh"), ("ssh-pass", "passSsh"), ("server-aktif", "serverAktif")]:
             v = ask(f"{k} (kosong=skip)")
+            if _is_cancel(v):
+                return print("Dibatalkan.")
             if v:
                 f[a] = v
         res = update_entry(tok, **f)
         print("Diperbarui:\n" + table_str([res]) if res else "Gagal")
 
     def do_renew():
-        tok = ask("ID / username")
-        d = ask("Tambah hari")
-        if not d.isdigit():
-            print("Hari harus angka"); return
-        res = renew_entry(tok, int(d))
+        tok = req_id()
+        if _is_cancel(tok):
+            return
+        d = ask_int("Tambah hari")
+        if _is_cancel(d):
+            return print("Dibatalkan.")
+        res = renew_entry(tok, d)
         print(f"Diperpanjang {d} hari -> {res['masaAktif']}" if res else "Gagal")
 
     def do_check():
-        d = ask("Batas hari", "7") or "7"
-        try:
-            dd = int(d)
-        except ValueError:
-            dd = 7
-        res = check_expiry(dd)
+        d = ask_int("Batas hari", 7)
+        if _is_cancel(d):
+            return
+        res = check_expiry(d)
         print("Kadaluarsa (" + str(len(res['expired'])) + "):\n" + table_str(res['expired']) +
-              "\nPeringatan <= " + str(dd) + " hari (" + str(len(res['warning'])) + "):\n" +
+              "\nPeringatan <= " + str(d) + " hari (" + str(len(res['warning'])) + "):\n" +
               table_str([x for x, _ in res['warning']]))
 
     def do_ssh():
-        tok = ask("ID / username")
-        if not resolve_id(tok):
-            print("Tidak ditemukan"); return
-        print("1. Jalankan perintah\n2. Setup otomatis (WendyVpn)")
-        p = input("Pilih> ").strip()
+        tok = req_id()
+        if _is_cancel(tok):
+            return
+        print("1. Jalankan perintah\n2. Setup otomatis (WendyVpn)\n3. Masuk terminal VPS (interaktif)")
+        p = ask("Pilih")
+        if _is_cancel(p):
+            return
         if p == "1":
-            c = ask("Perintah (kosong=test)")
-            print(_capture(cmd_ssh, types.SimpleNamespace(id=tok, cmd=c or None, setup=False)))
+            cc = ask("Perintah (kosong=test)")
+            if _is_cancel(cc):
+                return
+            print(_capture(cmd_ssh, types.SimpleNamespace(id=tok, cmd=cc or None, setup=False)))
         elif p == "2":
             print(_capture(cmd_ssh, types.SimpleNamespace(id=tok, cmd=None, setup=True)))
+        elif p == "3":
+            vps = next((it for it in load_vps() if it["id"] == resolve_id(tok)), None)
+            if not vps or not vps.get("userSsh") or not vps.get("passSsh"):
+                print("User/Password SSH kosong — isi lewat Update.")
+                return
+            host = vps["ipVps"][1:] if vps["ipVps"].startswith("'") else vps["ipVps"]
+            print("Masuk ke terminal VPS (ketik 'exit' untuk kembali)...")
+            out = ssh_shell(host, vps["userSsh"], vps["passSsh"])
+            if out:
+                print(out)
+        else:
+            print("Pilihan tidak valid.")
 
     def do_dns():
         def pick():
@@ -751,21 +837,22 @@ def text_menu_main():
                 print("Tidak ada domain")
                 return None
             for i, z in enumerate(zones, 1):
-                print(f"{i}. {z['name']}  ({z['status']})")
-            try:
-                i = int(input("Pilih domain> ")) - 1
-            except ValueError:
+                print(f"  {i}. {z['name']}  ({z['status']})")
+            n = ask_int("Pilih domain (kosong=batal)")
+            if _is_cancel(n):
                 return None
-            return zones[i] if 0 <= i < len(zones) else None
+            return zones[n - 1] if 0 <= n - 1 < len(zones) else None
 
         print("1. Setel kredensial\n2. List zona\n3. List record\n4. Tambah record\n5. Hapus record\n6. Update DNS VPS -> push GitHub")
-        p = input("Pilih> ").strip()
+        p = ask("Pilih")
+        if _is_cancel(p):
+            return
         if p == "1":
             save_cf({"email": ask("Cloudflare email"), "key": ask("Global API Key")})
             print("Disimpan")
         elif p == "2":
             zones, err = _cf_zones()
-            print(err or "\n".join(f"{z['name']}  id={z['id']}" for z in (zones or [])) or "kosong")
+            print(err or "\n".join(f"  {z['name']}  id={z['id']}" for z in (zones or [])) or "kosong")
         elif p == "3":
             z = pick()
             if z:
@@ -784,14 +871,13 @@ def text_menu_main():
                 body, _ = cf_request("GET", f"zones/{z['id']}/dns_records")
                 recs = body.get("result", []) if body and body.get("success") else []
                 for i, r in enumerate(recs, 1):
-                    print(f"{i}. {r['type']} {r['name']} -> {r['content']}")
-                try:
-                    i = int(input("Pilih record> ")) - 1
-                except ValueError:
+                    print(f"  {i}. {r['type']} {r['name']} -> {r['content']}")
+                n = ask_int("Pilih record")
+                if _is_cancel(n):
                     return
-                if 0 <= i < len(recs):
+                if 0 <= n - 1 < len(recs):
                     print(_capture(cmd_dns, types.SimpleNamespace(action="del", email=None, key=None,
-                         zone=z["id"], record=recs[i]["id"], type=None, name=None, content=None, ttl="1", proxied=False)))
+                         zone=z["id"], record=recs[n - 1]["id"], type=None, name=None, content=None, ttl="1", proxied=False)))
         elif p == "6":
             z = pick()
             if not z:
@@ -801,14 +887,13 @@ def text_menu_main():
                 print("Data VPS kosong")
                 return
             for i, v in enumerate(data, 1):
-                print(f"{i}. {v['username']} {v['ipVps']} ({v['masaAktif']})")
-            try:
-                i = int(input("Pilih VPS> ")) - 1
-            except ValueError:
+                print(f"  {i}. {v['username']} {v['ipVps']} ({v['masaAktif']})")
+            n = ask_int("Pilih VPS")
+            if _is_cancel(n):
                 return
-            if not (0 <= i < len(data)):
+            if not (0 <= n - 1 < len(data)):
                 return
-            v = data[i]
+            v = data[n - 1]
             ip = v["ipVps"].lstrip("'")
             nm = ask("Subdomain (kosong=root domain)", v["username"])
             name = nm or z["name"]
@@ -818,10 +903,14 @@ def text_menu_main():
                 print(_capture(cmd_github, types.SimpleNamespace(action="sync")))
             else:
                 print("(GitHub tidak enabled/token kosong -> skip push)")
+        else:
+            print("Pilihan tidak valid.")
 
     def do_github():
         print("1. Setel konfig\n2. Import (pull)\n3. Sync (push)\n4. Tampilkan isi")
-        p = input("Pilih> ").strip()
+        p = ask("Pilih")
+        if _is_cancel(p):
+            return
         if p == "1":
             d = load_github() or {}
             d.update({"username": ask("GitHub user"), "repo": ask("Repo"), "filePath": ask("File path"),
@@ -833,13 +922,21 @@ def text_menu_main():
             print(_capture(cmd_github, types.SimpleNamespace(action="sync")))
         elif p == "4":
             print(_capture(cmd_github, types.SimpleNamespace(action="show")))
+        else:
+            print("Pilihan tidak valid.")
+
+    def _do_delete():
+        tok = ask("ID / username")
+        if _is_cancel(tok):
+            return print("Dibatalkan.")
+        print("Berhasil" if delete_entry(tok) else "Gagal/tidak ada")
 
     menu = [
         ("Lihat Daftar", lambda: print(table_str(load_vps()))),
         ("Tambah VPS", do_add),
         ("Cari", lambda: print(table_str(filter_data(load_vps(), search=input("Cari> "))))),
         ("Update", do_update),
-        ("Hapus", lambda: print("Berhasil" if delete_entry(ask("ID / username")) else "Gagal")),
+        ("Hapus", lambda: _do_delete()),
         ("Perpanjang", do_renew),
         ("Cek Kadaluarsa", do_check),
         ("SSH Remote", do_ssh),
@@ -851,12 +948,20 @@ def text_menu_main():
         w = shutil.get_terminal_size((80, 24)).columns
         for line in BANNER:
             print(c(line.center(w), 1, 96))
-        print(c("=== ManageSC CLI — menu teks ===".center(w), "bold", 96))
-        for i, (l, _) in enumerate(menu, 1):
-            print(c(f"{i:2}. {l}".center(w), "bold", 92))
-        choice = input(c("Pilih (1-11, 0=Keluar)> ".center(w), "bold", 93)).strip()
-        if choice in ("0", "11"):
+        print(c("=== ManageSC CLI — menu teks ===".center(w), 1, 96))
+        menu_lines = [f"{i:2}. {l}" for i, (l, _) in enumerate(menu, 1)]
+        block_w = max((len(x) for x in menu_lines), default=20)
+        indent = max(0, (w - block_w) // 2)
+        for ml in menu_lines:
+            print(" " * indent + c(ml, 1, 92))
+        try:
+            choice = input(" " * indent + c("Pilih (1-N, 0=Keluar, 'batal'=batal)> ", 1, 93)).strip()
+        except (EOFError, KeyboardInterrupt):
             break
+        if choice.lower() in ("0", "q", "exit", "keluar") or choice == str(len(menu)):
+            break
+        if choice.lower() in _CANCEL_TOKENS:
+            continue
         try:
             idx = int(choice) - 1
         except ValueError:
@@ -896,6 +1001,8 @@ def _run_tui(stdscr):
         lines.append("[up/down] pilih  [Enter] jalankan  [q/Esc] kembali")
         block_h = len(lines) + len(items)
         start_y = max(0, (H - block_h) // 2)
+        menu_w = max((len(l) for l, _ in items), default=20)
+        start_x = max(0, (W - menu_w) // 2)
         y = start_y
         if banner and H >= 14:
             for line in BANNER:
@@ -911,10 +1018,9 @@ def _run_tui(stdscr):
         except Exception:
             pass
         for i, (label, _) in enumerate(items):
-            x = max(0, (W - len(label)) // 2)
             try:
                 style = curses.A_REVERSE | (curses.color_pair(2) if i == sel else 0)
-                stdscr.addstr(y + i, x, label, style)
+                stdscr.addstr(y + i, start_x, label, style)
             except Exception:
                 pass
         stdscr.refresh()
@@ -929,7 +1035,13 @@ def _run_tui(stdscr):
         stdscr.refresh()
         s = stdscr.getstr().decode("utf-8", "replace").strip()
         curses.noecho()
+        if s.lower() in _CANCEL_TOKENS:
+            return CANCEL
         return s
+
+    def gt(prompt, y=None):
+        r = get_text(prompt, y)
+        return "" if _is_cancel(r) else r
 
     def show_text(title, text):
         lines = text.split("\n")
@@ -970,7 +1082,11 @@ def _run_tui(stdscr):
                 fn = items[sel][1]
                 if fn is None:
                     return
-                r = fn()
+                try:
+                    r = fn()
+                except Exception as e:
+                    show_text("Error", str(e))
+                    continue
                 if isinstance(r, str):
                     show_text(items[sel][0], r)
             elif ch in (ord("q"), 27):
@@ -981,18 +1097,18 @@ def _run_tui(stdscr):
 
     def h_add():
         u = get_text("Username")
-        t = get_text("Tipe (limit/unli)")
+        if _is_cancel(u):
+            show_text("Batal", "Dibatalkan")
+            return
+        t = gt("Tipe (limit/unli)")
         if t not in ("limit", "unli"):
             show_text("Salah", "Tipe harus limit atau unli")
             return
-        ma = get_text("Masa aktif (hari utk limit / kosong=Lifetime)")
-        ip = get_text("IP VPS")
-        em = get_text("Email")
-        ram = get_text("RAM")
-        ps = get_text("Pesan")
-        su = get_text("SSH user")
-        sp = get_text("SSH pass")
-        sa = get_text("Server aktif (true/false)")
+        ma = gt("Masa aktif (hari utk limit / kosong=Lifetime)")
+        ip = gt("IP VPS")
+        em = gt("Email"); ram = gt("RAM"); ps = gt("Pesan")
+        su = gt("SSH user"); sp = gt("SSH pass")
+        sa = gt("Server aktif (true/false)") or "true"
         item = add_entry(u, t, ma, ip, em, ram, ps, su, sp, str(sa).lower() != "false")
         show_text("Tambah", "Data disimpan:\n" + table_str([item]))
 
@@ -1002,6 +1118,9 @@ def _run_tui(stdscr):
 
     def h_update():
         tok = get_text("ID / username")
+        if _is_cancel(tok):
+            show_text("Batal", "Dibatalkan")
+            return
         if not resolve_id(tok):
             show_text("?", "Tidak ditemukan")
             return
@@ -1009,7 +1128,7 @@ def _run_tui(stdscr):
         for key, attr in [("username", "username"), ("tipe", "tipeAkun"), ("masa-aktif", "masaAktif"),
                           ("ip", "ipVps"), ("email", "emailMember"), ("ram", "ram"), ("pesan", "pesan"),
                           ("ssh-user", "userSsh"), ("ssh-pass", "passSsh"), ("server-aktif", "serverAktif")]:
-            v = get_text(f"{key} (kosong=skip)")
+            v = gt(f"{key} (kosong=skip)")
             if v:
                 f[attr] = v
         res = update_entry(tok, **f)
@@ -1045,20 +1164,42 @@ def _run_tui(stdscr):
 
     def h_ssh():
         tok = get_text("ID / username")
+        if _is_cancel(tok):
+            return
         if not resolve_id(tok):
             show_text("?", "Tidak ditemukan")
             return
 
         def run_cmd():
             c = get_text("Perintah (kosong=test koneksi)")
+            if _is_cancel(c):
+                return "Dibatalkan"
             return _capture(cmd_ssh, types.SimpleNamespace(id=tok, cmd=c or None, setup=False))
 
         def run_setup():
             return _capture(cmd_ssh, types.SimpleNamespace(id=tok, cmd=None, setup=True))
 
+        def run_shell():
+            vps = next((it for it in load_vps() if it["id"] == resolve_id(tok)), None)
+            if not vps or not vps.get("userSsh") or not vps.get("passSsh"):
+                return "User/Password SSH kosong — isi lewat Update."
+            host = vps["ipVps"][1:] if vps["ipVps"].startswith("'") else vps["ipVps"]
+            try:
+                curses.endwin()
+            except Exception:
+                pass
+            ssh_shell(host, vps["userSsh"], vps["passSsh"])
+            try:
+                stdscr.keypad(True)
+                curses.curs_set(0)
+            except Exception:
+                pass
+            return "Sesi selesai."
+
         menu_loop("SSH — " + tok, [
             ("Jalankan perintah", run_cmd),
             ("Setup otomatis (WendyVpn)", run_setup),
+            ("Masuk terminal VPS (interaktif)", run_shell),
             ("Kembali", None),
         ])
 
@@ -1071,7 +1212,7 @@ def _run_tui(stdscr):
                 return None, "Tidak ada domain"
             show_text("Pilih Domain", "\n".join(f"{i+1}. {z['name']} ({z['status']})" for i, z in enumerate(zones)))
             n = get_text("Nomor domain (kosong=batal)")
-            if not n:
+            if _is_cancel(n) or not n:
                 return None, "batal"
             try:
                 i = int(n) - 1
@@ -1080,7 +1221,7 @@ def _run_tui(stdscr):
             return (zones[i] if 0 <= i < len(zones) else None), None
 
         def cfg():
-            save_cf({"email": get_text("Cloudflare email"), "key": get_text("Global API Key")})
+            save_cf({"email": gt("Cloudflare email"), "key": gt("Global API Key")})
             return "Disimpan"
 
         def act_list():
@@ -1100,10 +1241,10 @@ def _run_tui(stdscr):
                 return
             if not z:
                 return
-            ty = get_text("Type", "A")
-            nm = get_text("Name (kosong=root)")
-            ct = get_text("Content (IP)")
-            pr = get_text("Proxied? (y/n)") == "y"
+            ty = gt("Type") or "A"
+            nm = gt("Name (kosong=root)")
+            ct = gt("Content (IP)")
+            pr = gt("Proxied? (y/n)") == "y"
             show_text("Tambah", _capture(cmd_dns, types.SimpleNamespace(
                 action="add", email=None, key=None, zone=z["id"], record=None, type=ty,
                 name=nm or z["name"], content=ct, ttl="1", proxied=pr)))
@@ -1119,6 +1260,8 @@ def _run_tui(stdscr):
             recs = body.get("result", []) if body and body.get("success") else []
             show_text("Pilih Record", "\n".join(f"{i+1}. {r['type']} {r['name']} -> {r['content']}" for i, r in enumerate(recs)))
             n = get_text("Nomor record")
+            if _is_cancel(n):
+                return
             try:
                 i = int(n) - 1
             except ValueError:
@@ -1141,6 +1284,8 @@ def _run_tui(stdscr):
                 return
             show_text("Pilih VPS", "\n".join(f"{i+1}. {v['username']} {v['ipVps']}" for i, v in enumerate(data)))
             n = get_text("Nomor VPS")
+            if _is_cancel(n):
+                return
             try:
                 i = int(n) - 1
             except ValueError:
@@ -1149,7 +1294,7 @@ def _run_tui(stdscr):
                 return
             v = data[i]
             ip = v["ipVps"].lstrip("'")
-            nm = get_text("Subdomain (kosong=root domain)", v["username"])
+            nm = gt("Subdomain (kosong=root domain)") or v["username"]
             name = nm or z["name"]
             out = _dns_upsert(z["id"], name, ip)
             gh = load_github()
@@ -1173,11 +1318,11 @@ def _run_tui(stdscr):
 
     def h_github():
         def cfg():
-            u = get_text("GitHub user")
-            rp = get_text("Repo")
-            fp = get_text("File path")
-            tk = get_text("Token")
-            en = get_text("Enabled (true/false)") == "true"
+            u = gt("GitHub user")
+            rp = gt("Repo")
+            fp = gt("File path")
+            tk = gt("Token")
+            en = gt("Enabled (true/false)") == "true"
             d = load_github() or {}
             d.update({"username": u, "repo": rp, "filePath": fp, "token": tk, "enabled": en})
             save_github(d)
@@ -1272,10 +1417,11 @@ def build_parser():
     t = sub.add_parser("tui", help="launch TUI interaktif (default bila tanpa argumen)")
     t.set_defaults(func=lambda a: tui_main())
 
-    s = sub.add_parser("ssh", help="remote SSH: test / jalankan perintah / setup otomatis")
+    s = sub.add_parser("ssh", help="remote SSH: test / jalankan perintah / setup otomatis / terminal interaktif")
     s.add_argument("id", help="id, awalan id, atau username VPS")
     s.add_argument("--cmd", help="perintah yang dijalankan di VPS")
     s.add_argument("--setup", action="store_true", help="jalankan skrip setup otomatis (WendyVpn)")
+    s.add_argument("--shell", action="store_true", help="masuk terminal VPS secara interaktif")
     s.set_defaults(func=cmd_ssh)
 
     dns = sub.add_parser("dns", help="kelola DNS Cloudflare")
